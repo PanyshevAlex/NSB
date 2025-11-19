@@ -15,4 +15,9 @@ def get_parser():
     parser.add_argument("--cosine_annealing_ratio", type=float, default=0.2)
     parser.add_argument("--step_lr_gamma", type=float, default=0.5)
     parser.add_argument("--step_lr_step_size", type=int, default=250)
+    parser.add_argument("--label_aggregator_window", type=int, default=7)
+    parser.add_argument("--label_aggregator_noise_factor", type=float, default=0.01)
+    parser.add_argument("--label_aggregator_mode", type=str, default='moving_average')
+    parser.add_argument("--dataset_size", type=float, default=1.)
+    
     return parser

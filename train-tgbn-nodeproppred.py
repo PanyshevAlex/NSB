@@ -10,6 +10,7 @@ from models.mtgn import MTGNMemory, LastAggregator, LastNeighborLoader
 from models.embmodule import MGraphAttentionEmbedding
 from models.msgmodule import EncodeIndexModule
 from models.decoder import NodePredictor
+from modules.labels import LabelAggregator
 from logger.logger import Logger
 
 from torch_geometric.loader import TemporalDataLoader
@@ -22,6 +23,8 @@ from tgb.nodeproppred.evaluate import Evaluator
 from tgb.utils.utils import set_random_seed
 
 from torch.optim.lr_scheduler import LRScheduler
+
+import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -48,6 +51,7 @@ def train(
         train_loader,
         optimizer,
         assoc,
+        label_aggregator,
         use_gnn=True):
     eval_metric = dataset.eval_metric
 
@@ -59,6 +63,7 @@ def train(
 
     memory.reset_state()  # Start with a fresh memory.
     neighbor_loader.reset_state()  # Start with an empty graph.
+    label_aggregator.reset_state()
 
     total_loss = 0
     label_t = dataset.get_label_time()  # check when does the first label start
@@ -76,6 +81,7 @@ def train(
         query_t = batch.t[-1]
         # check if this batch moves to the next day
         if query_t > label_t:
+            
             # find the node labels from the past day
             label_tuple = dataset.get_node_label(query_t)
             label_ts, label_srcs, labels = (
@@ -83,6 +89,9 @@ def train(
                 label_tuple[1],
                 label_tuple[2],
             )
+            
+            label_aggregator.update(label_srcs.to(device), labels.to(device))
+            
             label_t = dataset.get_label_time()
             label_srcs = label_srcs.to(device)
 
@@ -96,6 +105,17 @@ def train(
                 msg[previous_day_mask],
                 neighbor_loader
             )
+            
+            nodes = torch.unique(torch.cat([src[previous_day_mask], dst[previous_day_mask]]))
+            label_tuple = label_aggregator.get_node_label(nodes)
+            label_srcs, labels = (
+                label_tuple[0],
+                label_tuple[1],
+            )
+            if len(label_srcs) == 0:
+                continue
+            
+            label_srcs = label_srcs.to(device)
 
             # Reset edges to be the edges from tomorrow so they can be used later
             src, dst, t, msg = (
@@ -131,17 +151,17 @@ def train(
             pred = node_pred(z)
 
             loss = criterion(pred, labels.to(device))
-            np_pred = pred.cpu().detach().numpy()
-            np_true = labels.cpu().detach().numpy()
+            # np_pred = pred.cpu().detach().numpy()
+            # np_true = labels.cpu().detach().numpy()
 
-            input_dict = {
-                "y_true": np_true,
-                "y_pred": np_pred,
-                "eval_metric": [eval_metric],
-            }
-            result_dict = evaluator.eval(input_dict)
-            score = result_dict[eval_metric]
-            total_score += score
+            # input_dict = {
+            #     "y_true": np_true,
+            #     "y_pred": np_pred,
+            #     "eval_metric": [eval_metric],
+            # }
+            # result_dict = evaluator.eval(input_dict)
+            # score = result_dict[eval_metric]
+            # total_score += score
             num_label_ts += 1
 
             loss.backward()
@@ -149,14 +169,53 @@ def train(
             total_loss += float(loss)
 
             metrics = {
-                "train/loss": total_loss / num_label_ts,
+                # "train/loss": total_loss / num_label_ts,
                 "train/epoch": count / train_loader_length + epoch,
                 f"train/{eval_metric}": total_score / num_label_ts,
             }
             wandb.log(metrics)
+        else:
 
-        # Update memory and neighbor loader with ground-truth state.
-        process_edges(memory, src, dst, t, msg, neighbor_loader)
+            # Update memory and neighbor loader with ground-truth state.
+            process_edges(memory, src, dst, t, msg, neighbor_loader)
+            
+            nodes = torch.unique(torch.cat([src, dst]))
+            
+            label_tuple = label_aggregator.get_node_label(nodes)
+            
+            label_srcs, labels = (
+                label_tuple[0],
+                label_tuple[1],
+            )
+            
+            if len(label_srcs) == 0:
+                continue
+            
+            label_srcs = label_srcs.to(device)
+            
+            n_id = label_srcs
+            n_id_neighbors, mem_edge_index, e_id = neighbor_loader(n_id)
+            assoc[n_id_neighbors] = torch.arange(n_id_neighbors.size(0), device=device)
+
+            z, last_update = memory(n_id_neighbors)
+            if use_gnn:
+                z = gnn(
+                    z,
+                    last_update,
+                    mem_edge_index,
+                    data.t[e_id].to(device),
+                    data.msg[e_id].to(device),
+                )
+
+            z = z[assoc[n_id]]
+
+            pred = node_pred(z)
+            loss = criterion(pred, labels.to(device))
+
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss)
+
         memory.detach()
 
     lr_scheduler.step()
@@ -297,6 +356,13 @@ def main(args):
     train_data = data[train_mask]
     val_data = data[val_mask]
     test_data = data[test_mask]
+    
+    dataset_size = args.dataset_size
+    idx = int(train_data.t.size(0) * (1 - dataset_size))
+    t_threshold = train_data.t[idx].item()
+    train_data = train_data[idx:]
+    target_idx = np.where(dataset.dataset.label_ts > t_threshold)[0].min()
+    dataset.dataset.label_ts_idx = target_idx
 
     # hyperparameters
     epochs = args.epochs
@@ -389,6 +455,15 @@ def main(args):
     test_ndcgs = []
 
     eval_metric = dataset.eval_metric
+    
+    label_aggregator = LabelAggregator(
+        num_nodes=data.num_nodes,
+        num_classes=dataset.num_classes,
+        window=args.label_aggregator_window,
+        noise_factor=args.label_aggregator_noise_factor,
+        mode=args.label_aggregator_mode,
+    ).to(device)
+    
     for epoch in range(1, epochs + 1):
         start_time = timeit.default_timer()
         train_dict = train(
@@ -404,7 +479,8 @@ def main(args):
             train_loader=train_loader,
             optimizer=optimizer,
             assoc=assoc,
-            use_gnn=use_gnn
+            use_gnn=use_gnn,
+            label_aggregator=label_aggregator,
         )
         logger.log_and_write("------------------------------------")
         logger.log_and_write(f"training Epoch: {epoch:02d}")
