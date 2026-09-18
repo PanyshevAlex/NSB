@@ -4,6 +4,10 @@ saved_models/
 saved_results/
 models/__pycache__/
 wandb/
+mlruns/
+mlflow.db
+.mcp.json
+experiments/.ipynb_checkpoints/
 *.pyc
 slurm-log/
 *.job

@@ -1,0 +1,10 @@
+[mcp_servers.jupyter]
+command = "uvx"
+args = ["jupyter-mcp-server"]
+
+[mcp_servers.jupyter.env]
+DOCUMENT_URL = "http://localhost:8890"
+DOCUMENT_TOKEN = "tgn2q2026"
+DOCUMENT_ID = "experiments/analysis.ipynb"
+RUNTIME_URL = "http://localhost:8890"
+RUNTIME_TOKEN = "tgn2q2026"

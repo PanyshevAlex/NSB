@@ -1,0 +1,213 @@
+\section{Method}
+\label{sec:method}
+
+
+The core state of our method is a dense, per-\emph{pair} affinity memory
+$\mathbf{M}\in\mathbb{R}^{N_{\text{user}}\times N_{\text{item}}}$, one \emph{scalar}
+cell $M_{u,i}(t)$ per (user, item) pair. Here $u$ indexes a user node and $i$ an
+item node; item nodes occupy the id range $[0,C)$ and user nodes occupy $[C,N)$,
+and the two id sets are disjoint, so the flat cell address $u\cdot C + i$ is
+well defined.
+
+\paragraph{Write transform: parameter-free rank/ECDF}
+\label{subsec:write-transform}
+
+Raw interaction weights $w_e$ (column $0$ of the raw message of event $e$) are
+heavy-tailed and, on some datasets, signed; feeding them directly into an additive
+memory is numerically brittle and fails to transfer across datasets. We therefore
+route every write through the causal empirical CDF (rank transform) of $w_e$
+against the training weights,
+\begin{equation}
+\phi(w) \;=\; \frac{1}{n_{\mathrm{tr}}}\,
+\bigl|\{\, w' \in \mathcal{W}_{\mathrm{tr}} : w' \le w \,\}\bigr|
+\;\in\; (0,1],
+\label{eq:phi}
+\end{equation}
+where $\mathcal{W}_{\mathrm{tr}}$ is the multiset of interaction weights on the
+official TGB train split (size $n_{\mathrm{tr}}$). Because $\mathcal{W}_{\mathrm{tr}}$
+is fixed from the train split only, $\phi$ is strictly causal and introduces no
+label leakage.
+
+\paragraph{Continuous-time decayed affinity}
+\label{subsec:decayed-affinity}
+
+The affinity in cell $(u,i)$ is the exponentially decayed sum of all past
+$\phi$-transformed interactions between $u$ and $i$:
+\begin{equation}
+M_{u,i}(t) \;=\;
+\sum_{\substack{e\ \text{on}\ (u,i)\\ t_e < t}}
+\phi(w_e)\; e^{-\alpha\,(t - t_e)},
+\qquad
+\alpha \;=\; \frac{\ln 2}{\kappa\,\Delta}
+\label{eq:M}
+\end{equation}
+Here $t_e$ is the event timestamp, $\kappa$ is the \emph{half-life in days}
+(after $\kappa$ days an interaction's contribution is halved), and the
+characteristic unit $\Delta$ is fixed to one day, so $\kappa$ is the single
+interpretable knob controlling temporal locality. Empirically a \emph{moderate}
+decay is optimal, neither uniform ($\alpha\!\to\!0$) nor purely persistent:
+$\kappa\approx 40$ days is a near-universal optimum on the continuous-time
+datasets ($\texttt{tgbn-genre}$, $\texttt{tgbn-reddit}$), and $\kappa\approx 16$
+on $\texttt{tgbn-token}$.
+
+\paragraph{Streaming update (write).}
+Equation~\eqref{eq:M} is realized online without storing the event history. On a
+batch $b$ with reference timestamp $t_b$ (the batch's maximum event time), each
+touched cell is decayed to $t_b$ and then incremented by the (undecayed) sum of
+that batch's transformed weights,
+\begin{equation}
+M_{u,i} \;\leftarrow\;
+M_{u,i}\, e^{-\alpha\,(t_b - t_{u,i})}
+\;+\!\!\sum_{\substack{e\in b\\ e\ \text{on}\ (u,i)}}\!\! \phi(w_e),
+\qquad
+t_{u,i} \;\leftarrow\; t_b,
+\label{eq:write}
+\end{equation}
+where $t_{u,i}$ is the per-cell last-update timestamp. Decay is applied at
+batch-max-timestamp granularity, and the within-batch $\phi$-sum is added
+undecayed. Setting $\alpha\le 0$ recovers pure additive accumulation (no decay).
+
+\paragraph{Read.}
+Selection, edge features, and the distillation teacher all consume the
+\emph{read-time-decayed} affinity, obtained by decaying each cell forward from its
+last write to the latest inserted time $t_{\text{now}}$,
+\begin{equation}
+\tilde M_{u,i}
+\;=\;
+M_{u,i}\, e^{-\alpha\,(t_{\text{now}} - t_{u,i})}.
+\label{eq:read}
+\end{equation}
+
+
+\paragraph{Feasibility: linear vs.\ quadratic state}
+\label{subsec:feasibility}
+
+Materializing dense per-pair state is only tractable because of the item--user
+asymmetry $N_{\text{item}}\ll N_{\text{user}}$. In the general temporal-graph
+setting, per-pair state over \emph{all} node pairs is fully relational and scales
+quadratically,
+\begin{equation}
+\underbrace{\mathcal{O}\!\left(N_{\text{user}}^{2}\right)}_{\text{fully relational}}
+\;\xrightarrow{\ \text{item--user}\ }\;
+\underbrace{\mathcal{O}\!\left(N_{\text{user}}\, N_{\text{item}}\right)}_{\text{ours (linear in users)}},
+\frac{N_{\text{item}}}{N_{\text{user}}}\ll 1 .
+\label{eq:complexity}
+\end{equation}
+Because the item axis is capped by $C=N_{\text{item}}$, the per-pair matrix is
+linear in the number of users. The asymmetry is pronounced on the datasets we
+target ($N_{\text{user}}/N_{\text{item}}$: genre $1.9\times$, reddit $15.9\times$,
+token $60.7\times$) and absent on $\texttt{tgbn-trade}$
+($254{\times}254$, ratio $\approx 1.0\times$) --- the symmetric counterexample
+where the lever does not apply.
+
+\paragraph{Memory-budget contrast.}
+The gap between~\eqref{eq:complexity}'s two regimes is decisive at scale. On the
+largest dataset, $\texttt{tgbn-token}$, the scalar per-pair matrix
+$\mathbf{M}$ (float32) costs $N_{\text{user}}\,N_{\text{item}}\cdot 4$ bytes
+$\approx 0.24$~GB, whereas the fully-relational $N_{\text{user}}^{2}$ state would
+cost $\approx 14.8$~GB --- a $\sim\!60\times$ blow-up.
+Table~\ref{tab:mem-budget} lists the scalar footprint per dataset.
+\begin{table}[t]
+\centering
+\begin{tabular}{lccc}
+\hline
+dataset & $N_{\text{user}}\!\times\!N_{\text{item}}$ & $\mathbf{M}$ & fully-relational $N_{\text{user}}^{2}$ \\
+\hline
+tgbn-trade  & $254\times254$      & $0.26$~MB & $0.26$~MB \\
+tgbn-genre  & $974\times513$      & $\sim 2$~MB   & $\sim 3.8$~MB \\
+tgbn-reddit & $11068\times698$    & $\sim 31$~MB  & $\sim 490$~MB \\
+tgbn-token  & $60745\times1001$   & $\sim 0.24$~GB & $\sim 14.8$~GB \\
+\hline
+\end{tabular}
+\caption{Per-pair \emph{scalar} memory footprint. The $\mathcal{O}(N_{\text{user}}N_{\text{item}})$
+matrix stays in the tens-of-MB to sub-GB range, while the general-case
+$\mathcal{O}(N_{\text{user}}^{2})$ per-pair state grows quadratically.}
+\label{tab:mem-budget}
+\end{table}
+
+\subsection{Integrating $\mathbf{M}$ into the learned model}
+\label{subsec:integration}
+
+The backbone is a standard TGNv2 pipeline: a per-node temporal memory with a GRU
+updater, a single graph-attention embedding layer (\textsc{TransformerConv}) over a
+sampled neighbourhood, and a single MLP head producing the per-item scores. The
+dense affinity $\mathbf{M}$ enters this pipeline at \emph{two} points, both strictly
+upstream of the (single) head: it \emph{selects} which item neighbours the attention
+sees, and it \emph{enriches} every message with a scalar affinity feature. $\mathbf{M}$
+itself remains parameter-free and non-differentiable; the learned model never emits
+or mixes a second prediction, so the result is a single-model architecture, not an
+ensemble.
+
+\paragraph{(i) Affinity-based neighbour selection.}
+The standard TGN neighbour loader feeds the embedding layer the $K$ \emph{most
+recent} interaction partners of the query user. We replace recency with affinity:
+for a query user $u$ at read time, the sampled neighbourhood is the set of its
+top-$K_M$ items by read-time-decayed affinity~\eqref{eq:read},
+\begin{equation}
+\mathcal{N}(u) \;=\;
+\operatorname*{Top\text{-}K_M}_{\,i\,:\,\tilde M_{u,i} > 0}\; \tilde M_{u,i},
+\qquad K_M \le C,
+\label{eq:select}
+\end{equation}
+with two properties that matter in practice. First, the set is
+\emph{variable-size}: only items with strictly positive affinity are returned, so a
+user with $m < K_M$ interacted items contributes $m$ neighbours rather than being
+padded with $K_M - m$ arbitrary (noise) items. Second, the sampler preserves the
+loader contract of the recency baseline: each selected pair $(u,i)$ is mapped, via a
+per-cell last-event buffer, back to the global index of the \emph{most recent event}
+on that pair, so the attention layer receives that edge's true timestamp and raw
+message for its relative-time encoding and edge features --- the selection changes
+\emph{which} item memories the head attends to, and nothing else. A small budget
+$K_M \approx 10$ (matching NDCG@10) is optimal on the datasets we study; selection
+decay $\kappa$ is shared with~\eqref{eq:M}.
+
+\paragraph{(ii) Affinity as a message-level feature.}
+Selection alone tells the model \emph{which} items matter but not \emph{how much}.
+We therefore additionally expose the affinity value itself as a first-class,
+message-like feature: a scalar column appended to the raw message, which then flows
+through every path the raw message takes --- the TGNv2 message function (and hence
+the GRU memory update) \emph{and} the attention edge features. Concretely, the two
+consumers read the affinity at two causally distinct reference times:
+\begin{align}
+\text{memory channel:}\quad
+\bar{m}_e &= \bigl[\, m_e \;\|\; \sigma\!\bigl(M_{u,i}(t_e^{-})\bigr) \bigr],
+\label{eq:mmsg-mem}\\
+\text{attention channel:}\quad
+\bar{a}_{(u,i)} &= \bigl[\, a_{(u,i)} \;\|\; \sigma\!\bigl(\tilde M_{u,i}\bigr) \bigr],
+\label{eq:mmsg-gnn}
+\end{align}
+where $m_e$ is the raw message of a ground-truth event $e=(u,i,t_e)$ being written
+into the temporal memory, $a_{(u,i)}$ are the edge features of a \emph{selected}
+edge from~\eqref{eq:select}, $\|$ denotes concatenation, and $\sigma$ is the squash
+defined below. In the memory channel the score $M_{u,i}(t_e^{-})$ is read
+\emph{strictly before} event $e$ is inserted into $\mathbf{M}$, so the stored
+message encodes the pair's history \emph{prior to} the event (no self-inclusion); in
+the attention channel the score is the same read-time-decayed value
+$\tilde M_{u,i}$ that the sampler ranked by. The message width grows by one; the
+message function, aggregator, and GRU input widths grow with it automatically, and
+the feature is exercised by the supervised path and evaluation identically.
+
+\paragraph{Squashing the affinity column.}
+Raw affinities are heavy-tailed: on \texttt{tgbn-genre} the per-edge scores reach
+$\mathcal{O}(10^{2})$--$\mathcal{O}(10^{3})$ while every neighbouring input feature
+(raw message, cosine time/index encodings) is $\mathcal{O}(1)$. Fed raw, this single
+column dominates the GRU pre-activations --- empirically it carries ${\sim}25\%$ of
+the input pre-activation norm and saturates an order of magnitude more gate units
+than the baseline ($9.5\%$ vs.\ $0.8\%$ of input pre-activations beyond $|x|>4$) ---
+which measurably degrades the learned model. We therefore squash the column with a
+monotone logarithmic map,
+\begin{equation}
+\sigma(x) \;=\; \log\bigl(1 + x\bigr),
+\label{eq:log1p}
+\end{equation}
+which bounds the column to the scale of its neighbours (e.g.\ $\sigma(2451)\approx
+7.8$) while preserving the affinity \emph{ordering}. The transform is applied
+identically in both channels~\eqref{eq:mmsg-mem}--\eqref{eq:mmsg-gnn}, so the score
+has one consistent meaning throughout the model.
+
+\paragraph{Single head, no ensembling.}
+Both integration points are input-side: $\mathbf{M}$ selects and annotates what the
+network reads, and the network's single MLP head produces the only per-item scores
+in the system. $\mathbf{M}$'s values never touch the output logits, are never mixed
+with the head's prediction, and carry no learned parameters; disabling either
+integration point recovers the corresponding ablation of the same single model.

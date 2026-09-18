@@ -1,0 +1,572 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+
+\title{Dense Per-(User,Item) Memory for Temporal Node-Affinity Prediction}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study node-affinity prediction on temporal \emph{bipartite} user--item graphs
+(the TGB \texttt{tgbn-*} benchmark), where at each label day one must predict, per
+user, a distribution over a small set of $C$ item classes. We exploit a structural
+asymmetry of these graphs---items are far fewer than users, $N_{\text{item}}\ll
+N_{\text{user}}$---to materialize a \emph{dense} per-(user,item) affinity memory
+$\mathbf{M}\in\mathbb{R}^{N_{\text{user}}\times N_{\text{item}}}$, a per-pair
+exponential-moving-average (equivalently a per-pair linear state-space model) with a
+causal rank/ECDF write transform. This dense state costs $O(N_{\text{user}}\,
+N_{\text{item}})$ (linear in users), whereas a fully relational $O(N_{\text{user}}^2)$
+state is intractable; the asymmetry is precisely what makes the approach feasible.
+We fold $\mathbf{M}$ into a learned TGNv2 as a \emph{neighbor selector}
+(``CountLoader''): for each query user the graph network attends to the user's
+top-$K$ highest-affinity items rather than its most-recent partners, while a
+\emph{single} prediction head still emits all scores---so the method is not an
+ensemble. As a non-learned ranker $\mathbf{M}$ alone already outperforms the learned
+TGNv2 baseline on all continuous datasets, and using it as the selector transfers
+that signal into the trained model.
+\end{abstract}
+
+
+\section{Problem Setup and Notation}
+\label{sec:setup}
+
+\subsection{Temporal bipartite user--item interaction graph}
+
+We are given a continuous-time stream of interaction events over a
+\emph{bipartite} node set that is partitioned into \emph{items} and \emph{users}.
+Let $N$ be the total number of nodes and let
+\begin{equation}
+  \mathcal{I} = \{0,1,\dots,C-1\}, \qquad
+  \mathcal{U} = \{C, C+1,\dots,N-1\},
+\end{equation}
+be the item and user node sets, respectively. The two id ranges are
+\emph{disjoint}: items occupy the low ids $[0,C)$ and users the high ids
+$[C,N)$ (asserted in code as $\mathrm{dst}.\max()<C$). We write $i\in\mathcal{I}$
+for an item and $u\in\mathcal{U}$ for a user throughout. The disjoint layout is
+what makes the flat cell address $u\cdot C + i$ a valid one-to-one encoding of a
+$(u,i)$ pair. We denote by
+\begin{equation}
+  C = N_{\text{item}} = |\mathcal{I}|, \qquad
+  N_{\text{user}} = |\mathcal{U}| = N - C
+\end{equation}
+the number of item nodes and user nodes. Crucially, the number of item
+\emph{classes} equals the number of item \emph{nodes}: the prediction target
+lives on the same $C$ items, so the item-node axis and the class axis are the
+\emph{same} axis (item $i$ aligns one-to-one with class $i$).
+
+The interaction stream is an ordered sequence of events
+\begin{equation}
+  \mathcal{E} = \big(e_1, e_2, \dots\big), \qquad
+  e = (u_e,\, i_e,\, t_e,\, w_e), \quad u_e\in\mathcal{U},\ i_e\in\mathcal{I},
+\end{equation}
+where $t_e$ is the event timestamp and $w_e\in\mathbb{R}$ is the raw interaction
+weight of event $e$, taken as column $0$ of the raw message vector attached to
+$e$. Every edge connects a user to an item; there are no user--user or
+item--item edges. Events arrive in non-decreasing time order and are consumed in
+temporal minibatches.
+
+\subsection{Per-day node-affinity prediction}
+
+Labels are emitted \emph{per label-timestamp} $\tau$ (a ``day''), not per edge.
+At each label-timestamp $\tau_1<\tau_2<\cdots$ the benchmark reveals, for an
+active subset of users $\mathcal{U}_\tau\subseteq\mathcal{U}$, a ground-truth
+affinity distribution
+\begin{equation}
+  y_u \in \mathbb{R}_{\ge 0}^{C}, \qquad \sum_{i=0}^{C-1} y_{u,i} = 1,
+\end{equation}
+i.e.\ a normalized interaction frequency of user $u$ over the $C$ item-classes
+for that period. The task is \emph{node-affinity prediction}: for each labelled
+user $u\in\mathcal{U}_\tau$ produce a score vector
+\begin{equation}
+  \hat{y}_u \in \mathbb{R}^{C}
+\end{equation}
+that ranks the $C$ items, using only causal history, i.e.\ events with
+$t_e < \tau$. Causality is enforced at label boundaries by a
+\texttt{previous\_day\_mask} that holds back post-boundary edges until after the
+prediction for day $\tau$ has been made, so no future interaction of the current
+day leaks into $\hat{y}_u$.
+
+\paragraph{Evaluation: NDCG@10.}
+Quality is measured by \emph{Normalized Discounted Cumulative Gain} at cutoff
+$k=10$ (hardcoded in TGB's \texttt{nodeproppred/evaluate.py}). For a labelled
+pair $(u,\tau)$, let $\pi_u$ be the ordering of items induced by ranking
+$\hat{y}_u$ in descending order, and let $\pi^\star_u$ be the ideal ordering that
+ranks by the ground truth $y_u$. Then
+\begin{equation}
+  \mathrm{DCG}@k(u) = \sum_{r=1}^{k}
+    \frac{y_{u,\,\pi_u(r)}}{\log_2(r+1)}, \qquad
+  \mathrm{NDCG}@k(u) =
+    \frac{\mathrm{DCG}@k(u)}{\mathrm{DCG}@k^{\star}(u)},
+\end{equation}
+where $\mathrm{DCG}@k^{\star}(u)$ is the same sum evaluated under the ideal
+ordering $\pi^\star_u$. The reported metric is $\mathrm{NDCG}@10$ averaged over
+all evaluated $(u,\tau)$ pairs that carry at least one positive label. The
+best test score is selected at the epoch with the best \emph{validation}
+$\mathrm{NDCG}@10$.
+
+\subsection{The user--item asymmetry $N_{\text{item}}\ll N_{\text{user}}$}
+
+The lever this work exploits is a structural asymmetry of the $\mathrm{tgbn}$-$*$
+graphs: items are far fewer than users,
+\begin{equation}
+  N_{\text{item}} \;\ll\; N_{\text{user}}.
+\end{equation}
+Concretely, with the ratio $\rho = N_{\text{user}}/N_{\text{item}}$:
+\begin{center}
+\begin{tabular}{lrrr}
+\hline
+dataset & $N_{\text{user}}$ & $N_{\text{item}}$ & $\rho$ \\
+\hline
+genre  & $974$   & $513$  & $1.9\times$ \\
+reddit & $11068$ & $698$  & $15.9\times$ \\
+token  & $60745$ & $1001$ & $60.7\times$ \\
+trade  & $254$   & $254$  & $1.0\times$ (counterexample) \\
+\hline
+\end{tabular}
+\end{center}
+This asymmetry makes it feasible to \emph{materialize} a dense per-$(u,i)$ state
+\begin{equation}
+  \mathbf{M}\in\mathbb{R}^{N_{\text{user}}\times N_{\text{item}}},
+  \qquad M_{u,i}(t)\in\mathbb{R}\ \text{(a scalar per cell)},
+\end{equation}
+whose row $M[u,:]$ is user $u$'s length-$C$ affinity over items. Storing one
+scalar per pair costs $O(N_{\text{user}}\,N_{\text{item}})$, which is
+\emph{linear} in the number of users, whereas a fully-relational per-$(u,u')$
+state would cost $O(N_{\text{user}}^2)$ and is intractable in the general
+temporal-graph case (e.g.\ on token, $0.24$\,GB float32 for $\mathbf{M}$ versus
+$14.8$\,GB for the quadratic state). The symmetric $\mathrm{tgbn}$-$\mathrm{trade}$
+graph ($254\times254$, $\rho\approx1.0$) does not exercise this lever and is
+reserved for paper-quality measurement. The dynamics of $\mathbf{M}$ and its
+read/write transforms are developed in the method section; here it serves only
+to fix the notation and to state the asymmetry that makes the dense
+per-$(u,i)$ representation admissible.
+
+\section{Dense per-pair memory}
+\label{sec:dense-per-pair-memory}
+
+The core state of our method is a dense, per-\emph{pair} affinity memory
+$\mathbf{M}\in\mathbb{R}^{N_{\text{user}}\times N_{\text{item}}}$, one \emph{scalar}
+cell $M_{u,i}(t)$ per (user, item) pair. Here $u$ indexes a user node and $i$ an
+item node; item nodes occupy the id range $[0,C)$ and user nodes occupy $[C,N)$,
+and the two id sets are disjoint, so the flat cell address $u\cdot C + i$ is
+well defined. Crucially, the $C=N_{\text{item}}$ item nodes and the $C$ prediction
+classes are the \emph{same} axis: column $i$ of $\mathbf{M}$ aligns one-to-one with
+class $i$, so a user's row $M[u,:]\in\mathbb{R}^{C}$ is a length-$C$ affinity
+profile over exactly the label space. We keep per-cell state a scalar rather than a
+$d$-dimensional vector; this is deliberate and, as \S\ref{subsec:feasibility}
+shows, is what makes the dense matrix materializable.
+
+\subsection{Write transform: parameter-free rank/ECDF}
+\label{subsec:write-transform}
+
+Raw interaction weights $w_e$ (column $0$ of the raw message of event $e$) are
+heavy-tailed and, on some datasets, signed; feeding them directly into an additive
+memory is numerically brittle and fails to transfer across datasets. We therefore
+route every write through the causal empirical CDF (rank transform) of $w_e$
+against the training weights,
+\begin{equation}
+\phi(w) \;=\; \frac{1}{n_{\mathrm{tr}}}\,
+\bigl|\{\, w' \in \mathcal{W}_{\mathrm{tr}} : w' \le w \,\}\bigr|
+\;\in\; (0,1],
+\label{eq:phi}
+\end{equation}
+where $\mathcal{W}_{\mathrm{tr}}$ is the multiset of interaction weights on the
+official TGB train split (size $n_{\mathrm{tr}}$). Because $\mathcal{W}_{\mathrm{tr}}$
+is fixed from the train split only, $\phi$ is strictly causal and introduces no
+label leakage. The map $\phi$ is parameter-free and non-differentiable: it has no
+learnable scale, and it is the one write transform that is never worst across all
+four $\texttt{tgbn-*}$ datasets (it wins outright on the heavy-tailed
+$\texttt{tgbn-token}$), whereas raw $\texttt{weight}$/$\texttt{count}$/$\log(1{+}w)$
+transforms degrade on the heavy-tailed, partly negative raw messages of
+$\texttt{tgbn-reddit}$.
+
+\subsection{Continuous-time decayed affinity}
+\label{subsec:decayed-affinity}
+
+The affinity in cell $(u,i)$ is the exponentially decayed sum of all past
+$\phi$-transformed interactions between $u$ and $i$:
+\begin{equation}
+M_{u,i}(t) \;=\;
+\sum_{\substack{e\ \text{on}\ (u,i)\\ t_e < t}}
+\phi(w_e)\; e^{-\alpha\,(t - t_e)},
+\qquad
+\alpha \;=\; \frac{\ln 2}{\kappa\,\Delta},
+\qquad
+\Delta = 1~\text{day} = 86400~\text{s}.
+\label{eq:M}
+\end{equation}
+Here $t_e$ is the event timestamp, $\kappa$ is the \emph{half-life in days}
+(after $\kappa$ days an interaction's contribution is halved), and the
+characteristic unit $\Delta$ is fixed to one day, so $\kappa$ is the single
+interpretable knob controlling temporal locality. Empirically a \emph{moderate}
+decay is optimal, neither uniform ($\alpha\!\to\!0$) nor purely persistent:
+$\kappa\approx 40$ days is a near-universal optimum on the continuous-time
+datasets ($\texttt{tgbn-genre}$, $\texttt{tgbn-reddit}$), and $\kappa\approx 16$
+on $\texttt{tgbn-token}$.
+
+\paragraph{Streaming update (write).}
+Equation~\eqref{eq:M} is realized online without storing the event history. On a
+batch $b$ with reference timestamp $t_b$ (the batch's maximum event time), each
+touched cell is decayed to $t_b$ and then incremented by the (undecayed) sum of
+that batch's transformed weights,
+\begin{equation}
+M_{u,i} \;\leftarrow\;
+M_{u,i}\, e^{-\alpha\,(t_b - t_{u,i})}
+\;+\!\!\sum_{\substack{e\in b\\ e\ \text{on}\ (u,i)}}\!\! \phi(w_e),
+\qquad
+t_{u,i} \;\leftarrow\; t_b,
+\label{eq:write}
+\end{equation}
+where $t_{u,i}$ is the per-cell last-update timestamp. Decay is applied at
+batch-max-timestamp granularity, and the within-batch $\phi$-sum is added
+undecayed. Setting $\alpha\le 0$ recovers pure additive accumulation (no decay).
+
+\paragraph{Read.}
+Selection, edge features, and the distillation teacher all consume the
+\emph{read-time-decayed} affinity, obtained by decaying each cell forward from its
+last write to the latest inserted time $t_{\text{now}}$,
+\begin{equation}
+\tilde M_{u,i}
+\;=\;
+M_{u,i}\, e^{-\alpha\,(t_{\text{now}} - t_{u,i})}.
+\label{eq:read}
+\end{equation}
+
+\subsection{Per-pair EMA \texorpdfstring{$=$}{=} per-pair linear SSM}
+\label{subsec:ssm}
+
+Each scalar cell $M_{u,i}$ evolves as a first-order linear recurrence:
+\eqref{eq:write} is precisely an exponential moving average, with a
+$\phi$-transformed input driving a state whose retention factor is
+$e^{-\alpha\,\delta t}$ over an elapsed interval $\delta t$. Equivalently, cell
+$(u,i)$ is an independent single-state discrete linear state-space model (SSM),
+\begin{equation}
+M_{u,i}^{(t)} \;=\; a\, M_{u,i}^{(t-1)} \;+\; \phi(w_e),
+\qquad
+a = e^{-\alpha\,\delta t}\in(0,1],
+\label{eq:ssm}
+\end{equation}
+whose closed form is exactly~\eqref{eq:M}. Thus $\mathbf{M}$ is a bank of
+$N_{\text{user}}\times N_{\text{item}}$ scalar EMAs / linear SSMs, one per
+(user, item) pair. This is the representational object the plain TGN memory
+provably cannot express (a moving-average / persistent forecast over messages)
+and is exactly the regime where non-learned TGB heuristics beat learned TGN.
+Where a global/virtual SSM state summarizes all interactions into a shared latent,
+our state is instantiated at \emph{per-pair} granularity: the differentiator is
+resolution, not the SSM idea itself. A further practical consequence is that
+$M_{u,i}$ carries signal from the \emph{first} interaction on that pair, avoiding
+the cold-start compression of a whole user history into a single memory vector.
+
+\subsection{Feasibility: linear vs.\ quadratic state}
+\label{subsec:feasibility}
+
+Materializing dense per-pair state is only tractable because of the item--user
+asymmetry $N_{\text{item}}\ll N_{\text{user}}$. In the general temporal-graph
+setting, per-pair state over \emph{all} node pairs is fully relational and scales
+quadratically,
+\begin{equation}
+\underbrace{\mathcal{O}\!\left(N_{\text{user}}^{2}\right)}_{\text{fully relational (intractable)}}
+\;\xrightarrow{\ \text{bipartite item--user}\ }\;
+\underbrace{\mathcal{O}\!\left(N_{\text{user}}\, N_{\text{item}}\right)}_{\text{ours (linear in users)}},
+\qquad
+\frac{N_{\text{item}}}{N_{\text{user}}}\ll 1 .
+\label{eq:complexity}
+\end{equation}
+Because the item axis is capped by $C=N_{\text{item}}$, the per-pair matrix is
+linear in the number of users. The asymmetry is pronounced on the datasets we
+target ($N_{\text{user}}/N_{\text{item}}$: genre $1.9\times$, reddit $15.9\times$,
+token $60.7\times$) and absent on $\texttt{tgbn-trade}$
+($254{\times}254$, ratio $\approx 1.0\times$) --- the symmetric counterexample
+where the lever does not apply, which is why trade is reserved for
+paper-quality measurement rather than for exercising the dense matrix.
+
+\paragraph{Memory-budget contrast.}
+The gap between~\eqref{eq:complexity}'s two regimes is decisive at scale. On the
+largest dataset, $\texttt{tgbn-token}$, the scalar per-pair matrix
+$\mathbf{M}$ (float32) costs $N_{\text{user}}\,N_{\text{item}}\cdot 4$ bytes
+$\approx 0.24$~GB, whereas the fully-relational $N_{\text{user}}^{2}$ state would
+cost $\approx 14.8$~GB --- a $\sim\!60\times$ blow-up that is exactly the
+asymmetry ratio and the difference between fitting in CPU RAM and not.
+Table~\ref{tab:mem-budget} lists the scalar footprint per dataset.
+\begin{table}[t]
+\centering
+\begin{tabular}{lccc}
+\hline
+dataset & $N_{\text{user}}\!\times\!N_{\text{item}}$ & scalar $\mathbf{M}$ (f32) & fully-relational $N_{\text{user}}^{2}$ (f32) \\
+\hline
+$\texttt{tgbn-trade}$  & $254\times254$      & $0.26$~MB & $0.26$~MB \\
+$\texttt{tgbn-genre}$  & $974\times513$      & $\sim 2$~MB   & $\sim 3.8$~MB \\
+$\texttt{tgbn-reddit}$ & $11068\times698$    & $\sim 31$~MB  & $\sim 490$~MB \\
+$\texttt{tgbn-token}$  & $60745\times1001$   & $\sim 0.24$~GB & $\sim 14.8$~GB \\
+\hline
+\end{tabular}
+\caption{Per-pair \emph{scalar} memory footprint. The $\mathcal{O}(N_{\text{user}}N_{\text{item}})$
+matrix stays in the tens-of-MB to sub-GB range, while the general-case
+$\mathcal{O}(N_{\text{user}}^{2})$ per-pair state grows quadratically. A per-cell
+\emph{vector} of width $d{=}64$ on token would already reach $\sim\!14.5$~GB ---
+the RAM ceiling --- which is why we keep each cell a scalar.}
+\label{tab:mem-budget}
+\end{table}
+Keeping the cell scalar (rather than a vector of width $d$) is what holds the
+budget in the tractable column: a width-$64$ vector on token would itself hit the
+$\sim\!14.5$~GB RAM ceiling. The scalar per-pair EMA is thus both the modeling
+choice of Eq.~\eqref{eq:M} and the feasibility choice of Eq.~\eqref{eq:complexity}.
+
+\section{Method: Integrating the Dense Affinity Memory as a Neighbour Selector}
+\label{sec:method-integration}
+
+\subsection{From per-node recency to per-pair affinity}
+
+The learned backbone is TGNv2: a per-node TGN memory with a \texttt{GRUCell} updater and a \texttt{LastAggregator} (the most recent message per node, selected by \texttt{scatter\_argmax} over timestamps), the source--target index-augmented message
+\begin{equation}
+\mathrm{msg}_e = \big[\, z_{\text{src}},\ z_{\text{dst}},\ \mathrm{raw\_msg}_e,\ \mathrm{src\_enc},\ \mathrm{dst\_enc},\ t\text{\_enc} \,\big],
+\end{equation}
+where the node \emph{indices} $\text{src},\text{dst}$ are encoded through a $\cos(\mathrm{Linear}(\cdot))$ \texttt{TimeEncoder} (\texttt{EncodeIndexModule}, toggled by \texttt{-{}-use\_tgnv2}; off $\Rightarrow$ \texttt{IdentityMessage} $=$ plain TGN), a single \texttt{TransformerConv} embedding with $2$ attention heads (each of width $d/2$, dropout $0.1$), and a $2$-layer MLP decoder. In the reference pipeline the embedding attends, per query user $u$, to the $x$ \emph{most recent} interaction partners returned by a recency \texttt{LastNeighborLoader}.
+
+We keep this backbone unchanged and intervene at exactly one point: \emph{which} neighbours the embedding attends to. In place of recency we use the dense per-$(u,i)$ affinity memory
+\begin{equation}
+M_{u,i}(t) \;=\; \sum_{t_e < t,\ e\in(u,i)} \phi(w_e)\, e^{-\alpha\,(t - t_e)}
+\;\in\;\mathbb{R},
+\qquad
+\mathbf{M}\in\mathbb{R}^{N_{\text{item}}\times N_{\text{user}}}\ \text{(per-cell scalar)},
+\end{equation}
+a per-pair EMA / linear SSM whose write transform $\phi(w)=\tfrac{1}{n_{\mathrm{tr}}}\,|\{w'\in\mathcal{W}_{\mathrm{tr}}: w'\le w\}|\in(0,1]$ is the parameter-free, non-differentiable causal rank/ECDF fit on the official TGB train-split weights $\mathcal{W}_{\mathrm{tr}}$ only, and whose decay rate $\alpha=\ln 2/(\kappa\,\Delta)$ has half-life $\kappa$ days ($\Delta=1\text{ day}=86400\text{ s}$). $\mathbf{M}$ is realizable as a dense buffer only because $N_{\text{item}}\ll N_{\text{user}}$: per-pair scalar state is $O(N_{\text{user}}N_{\text{item}})$, linear in users, versus the intractable $O(N_{\text{user}}^2)$ of fully relational state.
+
+\subsection{The selection rule (CountLoader / \texttt{MSampler})}
+
+Both reads and writes to $\mathbf{M}$ are strictly causal. Writes are applied in \texttt{process\_edges} on \emph{past} edges: for each touched cell the stored value is first decayed to the batch reference time $t_b=\max_e t_e$ and the in-batch $\phi$-mass is then accumulated undecayed,
+\begin{equation}
+M_{u,i} \leftarrow M_{u,i}\, e^{-\alpha\,(t_b - t_{u,i})} + \!\!\sum_{e\in\text{batch}\cap(u,i)}\!\! \phi(w_e),
+\qquad t_{u,i}\leftarrow t_b,
+\end{equation}
+with the per-cell last event id set to the latest contributing event (\texttt{scatter\_reduce} \texttt{amax}) so that a companion buffer \texttt{last\_eid}$[u,i]$ can recover the global index into $\texttt{data.t}/\texttt{data.msg}$ for edge features. At read time (a label boundary), user $u$'s row is decayed from its per-cell last-update time to the latest inserted timestamp $t_{\text{now}}$,
+\begin{equation}
+\tilde M_{u,i} \;=\; M_{u,i}\, e^{-\alpha\,(t_{\text{now}} - t_{u,i})},
+\end{equation}
+and the neighbour set is the variable-size top-$K$ of the \emph{decayed} row with zero-affinity slots removed:
+\begin{equation}
+\label{eq:selection}
+\boxed{\;
+\mathcal{N}_K(u) \;=\; \operatorname*{Top\text{-}K}_{\,i\,:\,\tilde M_{u,i}>0}\ \tilde M_{u,i},
+\qquad K = \min(k_M,\, C),
+\;}
+\end{equation}
+where $C=N_{\text{item}}$ is the number of item-classes and $k_M$ (\texttt{-{}-k\_m}) is the configured read budget (optimum $k_M\approx 10$). The mask $\tilde M_{u,i}>0$ \emph{drops} empty slots rather than padding them, so $|\mathcal{N}_K(u)|\le K$ is variable and no noise (zero-affinity) items are ever injected. Concretely \texttt{MSampler} (the \emph{CountLoader}, selected by \texttt{-{}-neighbor\_sampler memory}) is a drop-in replacement for \texttt{LastNeighborLoader}: it honours the same $(\texttt{n\_id},\ \texttt{mem\_edge\_index},\ \texttt{e\_id})$ contract, returning per query user the local item$\rightarrow$user edges over $\mathcal{N}_K(u)$ and the event ids $\texttt{e\_id}=\texttt{last\_eid}[u,i]$ used to fetch edge features, plus a fourth tensor $m_e$ (below). Thus the head sees the item-memories of $u$'s \emph{top-$K$ items by decayed affinity} instead of its $K$ most-recent partners.
+
+\subsection{The single learned head}
+
+The selected item-memories are consumed unchanged by the backbone: the \texttt{TransformerConv} produces the user embedding
+\begin{equation}
+z_u \;=\; \mathrm{TransformerConv}\!\big(\{\, \text{memory}(i) : i\in\mathcal{N}_K(u) \,\}\big),
+\end{equation}
+and a \emph{single} $2$-layer MLP head $g_\theta$ (\texttt{NodePredictor}: $\mathrm{Linear}\!\rightarrow\!\mathrm{ReLU}\!\rightarrow\!\mathrm{Linear}$, no internal softmax) emits the per-class logits
+\begin{equation}
+\hat y_u \;=\; g_\theta(z_u)\ \in\ \mathbb{R}^{C},
+\qquad
+\mathcal{L}_{\text{sup}} \;=\; \mathrm{CE}\big(\hat y_u,\, y_u\big).
+\end{equation}
+Because item nodes occupy ids $[0,C)$ and users occupy $[C,N)$ with the two id sets disjoint (asserted in \texttt{MSampler.insert}), the item-node axis and the class axis are the \emph{same} axis: column $i$ of $\mathbf{M}$ aligns $1{:}1$ with class $i$. Labels are emitted per label-timestamp (``day'') $\tau$; a \texttt{previous\_day\_mask} splits each boundary-crossing batch so that post-boundary edges are written into $\mathbf{M}$ (and memory) only after prediction, and the reported test score is taken at the epoch with best \emph{validation} NDCG@10 ($k=10$, hardcoded in TGB).
+
+\paragraph{Optional edge-feature variant (V2).}
+When \texttt{-{}-m\_edge\_feature} is set together with the memory sampler ($m_{\text{edge}\_}\dim=1$), the per-user-normalized affinity
+\begin{equation}
+m_e \;=\; \frac{\tilde M_{u,i}}{\max_{i'} \tilde M_{u,i'}}\ \in\ (0,1]
+\qquad(\text{top neighbour }=1)
+\end{equation}
+is concatenated into the \texttt{TransformerConv} edge attributes $\text{edge\_attr}=[\,\text{rel\_time\_enc},\ \text{msg},\ m_e\,]$ (with a neutral zero column when the recency sampler is used and $m_e$ is \texttt{None}). This weights, but does not replace, the attention over $\mathcal{N}_K(u)$; empirically it yields no gain beyond selection alone.
+
+\subsection{Single-head / no-ensemble property}
+
+Exactly one module emits final per-item scores: the single head $g_\theta$. The dense memory $\mathbf{M}$ is strictly \emph{upstream} of that head and occupies exactly one of three roles, none of which touches the logits:
+\begin{enumerate}
+\item[(1)] a neighbour \textbf{selector} --- Eq.~\eqref{eq:selection} chooses \emph{which} item-memories the head attends to (the main mechanism);
+\item[(2)] an attention edge-\textbf{feature} $m_e$ fed into the \texttt{TransformerConv} (V2);
+\item[(3)] a distillation \textbf{teacher} (row-normalized soft target, below).
+\end{enumerate}
+$\mathbf{M}$ is never added to, averaged with, or gated onto $\hat y_u$. In particular the following are forbidden as hidden fixed-weight ensembles of two predictors: $\hat y_u = g_\theta(z_u) + \tilde M_{u,:}$; adding or gating any data-derived score vector (an affinity row or an item-popularity vector, frozen or dynamic) onto the logits; a separate $\mathbf{M}$-head merged with the TGN head; a mixture-of-experts or multi-branch fusion at the output; or combining slow-GNN and fast-$\mathbf{M}$ predictions at inference. Only a static, freely learnable per-item bias $b_i$ may be added to the logits --- its value is learned, never initialized or frozen from popularity. The two attention heads of the \texttt{TransformerConv} are distinct from this single \emph{prediction} head and are not a committee. Also barred (per project constraints) are bagging/boosting/stacking/voting, snapshot ensembles, model soups, and EMA/SWA/seed-averaging of predictions. This yields a genuinely single-model formulation: the persistence signal that plain TGN structurally cannot express (the moving-average / persistent-forecast regime, TGNv2 paper Thm.~1) is restored by \emph{routing} the head to the right memories, not by blending an extra predictor into its output.
+
+\subsection{Auxiliary distillation variant}
+
+We additionally explored, but do not treat as the headline, a knowledge-distillation term that reuses $\tilde{\mathbf M}$ as a teacher. The soft target is the \emph{row-normalized} (not softmax) decayed affinity, placing all mass on the user's seen items,
+\begin{equation}
+p^{\text{teach}}_{u,i} \;=\; \frac{\tilde M_{u,i}}{\sum_{i'} \tilde M_{u,i'}},
+\end{equation}
+with cold (all-zero) rows dropped by a \texttt{warm} mask. On target-less batches (query timestamp $\le \tau$, i.e.\ the $\approx\!98\%$ of batches with no label that day), every \texttt{distill\_stride}-th batch adds
+\begin{equation}
+\mathcal{L}_{\text{KD}} \;=\; \lambda\; \mathrm{CE}\!\big(p^{\text{teach}}_u,\ \mathrm{softmax}(\hat y_u)\big)
+\end{equation}
+over warm users only, with \texttt{kd\_grad}$\in\{\text{full},\text{gnn\_head},\text{head}\}$ controlling how far the KD gradient propagates (protecting the sequential memory-eval reads). Crucially the supervised and KD paths \emph{share the same forward} (a single \texttt{\_student\_logits}), so they can never become two predictors: distillation regularizes the one head $g_\theta$ rather than adding a second one. Empirically its effect is marginal relative to the selection mechanism of Eq.~\eqref{eq:selection}.
+
+\section{Empirical anchors}
+\label{sec:anchors}
+Table~\ref{tab:anchors} lists test NDCG@10. The non-learned per-pair ranker
+(rank items along $\tilde M[u,:]$) already beats the learned TGNv2 on every
+continuous (bipartite) dataset, and the margin grows with the asymmetry
+$N_{\text{user}}/N_{\text{item}}$. \texttt{trade} is (near-)symmetric
+($\approx\!1\times$) and serves as a counterexample where the lever does not apply.
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+dataset & $N_{\text{user}}/N_{\text{item}}$ & M-only (non-learned) & TGNv2 (learned) \\
+\midrule
+trade  & $\approx\!1.0$ & $0.777^{*}$ & $0.735$ \\
+genre  & $1.9$          & $0.526$     & $0.469$ \\
+reddit & $15.9$         & $0.560$     & $0.507$ \\
+token  & $60.7$         & $0.449$     & $0.294$ \\
+\bottomrule
+\end{tabular}
+\caption{Test NDCG@10. $^{*}$On symmetric \texttt{trade} the per-pair memory is
+degenerate; we report the moving-average-over-messages heuristic instead.}
+\label{tab:anchors}
+\end{table}
+
+
+\section{Positioning and Related Work}
+\label{sec:related}
+
+\paragraph{The shared representational gap.}
+Our work, TGNv2, and NAViS all address the \emph{same} deficiency of the
+classic Temporal Graph Network (TGN). Plain TGN structurally cannot express a
+moving average or a persistent forecast over the stream of messages incident to
+a node: this is exactly the negative result formalized as Theorem~1 of the
+TGNv2 paper (arXiv:2411.03596). The practical symptom is well documented on the
+Temporal Graph Benchmark (TGB) \texttt{tgbn-*} node-affinity task, where two
+non-learned heuristics---a moving average over ground-truth messages (M) and
+over ground-truth labels (L)---beat the tuned learned TGN by a wide margin
+(Table~\ref{tab:anchor}). The affinity signal these heuristics recover is
+precisely a linear, decaying accumulation over past interactions, i.e.\ a linear
+state-space model (SSM); the equivalence ``EMA / SMA / persistent forecast are
+linear SSMs'' is the common lens through which all three methods re-inject the
+persistence signal that TGN discards. The three methods differ not in
+\emph{which} gap they patch, but in the \emph{granularity} of the state they add
+to patch it.
+
+\paragraph{TGNv2: per-node memory with node-index messages.}
+TGNv2 (arXiv:2411.03596) augments TGN at the message level. On top of the
+standard per-node memory updated by a GRU from aggregated messages, it encodes
+the source and destination node \emph{indices} through a time-style encoder and
+concatenates them into the message,
+\[
+  \mathrm{msg}_e \;=\; \bigl[\,z_{\mathrm{src}},\ z_{\mathrm{dst}},\ \mathrm{raw\_msg}_e,\ \mathrm{src\_enc},\ \mathrm{dst\_enc},\ t\text{\_enc}\,\bigr],
+\]
+which lets the memory recover an identity-indexed running statistic that plain
+TGN (with its \texttt{IdentityMessage}) cannot. The state remains \emph{per
+node}: user $u$ is still compressed into a single memory vector, and the
+per-partner history is entangled inside it. TGNv2 is this project's in-code
+learned baseline---the strongest \emph{learned} model on the reference table
+(Table~\ref{tab:anchor})---and the bar any new method must clear.
+
+\paragraph{NAViS: a global virtual SSM state.}
+NAViS (arXiv:2510.06940, Oct.\ 2025) is the closest competitor and shares our
+exact diagnosis: it fixes the proven TGN-cannot-express-persistence gap through
+\emph{state design} rather than through a heavier encoder, building explicitly on
+the ``moving average / persistent forecast is a linear SSM'' equivalence. Its
+lever, however, is a \emph{global / virtual} SSM state---a small number of
+shared state vectors that summarize the stream at the graph level. Because a
+new method in this space must be shown to advance beyond both prior fixes, we
+benchmark against \emph{both} NAViS and TGNv2.
+
+\paragraph{Ours: a per-\texorpdfstring{$(u,i)$}{(u,i)} matrix, i.e.\ a per-pair SSM.}
+We keep the SSM insight but push the state granularity to the finest useful
+level. We materialize a dense per-(user,item) affinity memory
+$\mathbf{M}\in\mathbb{R}^{N_{\text{user}}\times N_{\text{item}}}$, one
+\emph{scalar} $M_{u,i}$ per pair, and maintain each cell as an independent
+per-pair EMA (a scalar linear SSM),
+\begin{equation}
+  M_{u,i}(t)\;=\;\sum_{t_e < t}\ \phi(w_e)\,e^{-\alpha\,(t-t_e)},
+  \qquad \alpha=\frac{\ln 2}{\kappa\,\Delta},\ \ \Delta=1~\text{day},
+  \label{eq:perpair-ssm}
+\end{equation}
+where $\phi(\cdot)\in(0,1]$ is a parameter-free causal rank/ECDF write transform
+fit on the official TGB train split, and $\kappa$ is the half-life in days
+(empirically $\kappa\!\approx\!40$ on the continuous datasets, $\kappa\!\approx\!16$
+on token). The differentiator relative to NAViS is thus purely
+\emph{granularity}: a per-pair state
+($\mathcal{O}(N_{\text{user}}\!\cdot\!N_{\text{item}})$) rather than a global /
+virtual state. Because $M_{u,i}$ is significant from a user's \emph{first}
+interaction, it never compresses a user's per-item history into a single vector,
+which is why it directly targets the cold / weak user cohorts where TGN loses
+the persistence signal.
+
+\paragraph{The asymmetry is the lever.}
+Maintaining explicit per-pair state is tractable \emph{only} because the
+\texttt{tgbn-*} graphs are item--user bipartite with far fewer items than users,
+$N_{\text{item}}\!\ll\!N_{\text{user}}$: the item-node axis coincides with the
+$C=N_{\text{item}}$ prediction-class axis (column $i$ of $M$ aligns 1:1 with
+class $i$), so $\mathbf{M}$ costs
+$\mathcal{O}(N_{\text{user}}\!\cdot\!N_{\text{item}})$---\emph{linear} in users.
+A fully-relational per-pair state over arbitrary node pairs would cost
+$\mathcal{O}(N_{\text{user}}^2)$ and is intractable in the general
+temporal-graph case; concretely on token this is the difference between a
+$0.24$~GB scalar $M$ and a $14.8$~GB dense $N_{\text{user}}\!\times\!N_{\text{user}}$
+buffer. The observed asymmetry is what makes the dense-matrix approach feasible:
+genre $974/513\!=\!1.9\times$, reddit $11068/698\!=\!15.9\times$, token
+$60745/1001\!=\!60.7\times$. The counterexample is \texttt{tgbn-trade}
+($254/254\!\approx\!1.0\times$, symmetric), where the lever does not apply; we
+therefore reserve trade for paper-quality measurement and iterate methodology on
+genre, the smallest dataset that actually exhibits the asymmetry.
+
+\paragraph{Why this is worth pursuing: a non-learned anchor already wins.}
+The strongest evidence that per-pair state is the right granularity is that even
+a \emph{non-learned} ranker---ranking items along the read-time-decayed row
+$\tilde M_{u,i}=M_{u,i}\,e^{-\alpha(t_{\text{now}}-t_{u,i})}$, with no trained
+parameters---already beats the \emph{learned} TGNv2 on all three continuous
+datasets under the paper protocol (best-validation epoch, test NDCG@10, $k=10$):
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+Test NDCG@10 & genre & reddit & token \\
+\midrule
+TGN (tuned)                       & $0.367$ & $0.315$ & $0.169$ \\
+\textbf{TGNv2} (strongest learned)& $0.469$ & $0.507$ & $0.294$ \\
+\midrule
+\textbf{$M$-only ranker (non-learned, ours)} & $\mathbf{0.526}$ & $\mathbf{0.560}$ & $\mathbf{0.449}$ \\
+\midrule
+MovAvg over messages (M), ceiling & $0.472$ & $0.411$ & $0.415$ \\
+MovAvg over labels (L), ceiling   & $0.509$ & $0.559$ & $0.508$ \\
+\bottomrule
+\end{tabular}
+\caption{The parameter-free per-pair anchor beats the strongest learned model.
+$M$-only genre reports the message-space number ($0.530$ in label-space);
+reddit uses $\kappa\!=\!40$, token uses $\kappa\!=\!16$ with the rank write
+transform. (M)/(L) consume ground-truth messages/labels and set the absolute
+ceiling. \texttt{tgbn-trade} is omitted here: its yearly timestamps collapse a
+year of edges onto one label, so message-space evaluation leaks and requires a
+strict-causal protocol.}
+\label{tab:anchor}
+\end{table}
+
+\noindent
+On genre the anchor is $+0.057$ over TGNv2, on reddit $+0.053$ (matching the
+best static heuristic MovAvg(L), $0.559$), and on token $+0.155$. The paper's
+learned bar is therefore a \emph{floor}, not a ceiling: the per-pair state
+carries signal that the per-node and global-state models cannot reach. Our
+learned method turns this anchor into a component of a single trained model
+(Section~\ref{sec:method}), using $\mathbf{M}$ strictly \emph{upstream} of one
+prediction head---as a top-$K$ item-neighbor selector, an attention edge
+feature, and a distillation teacher---never as an additive or gated term on the
+logits, so the method remains a single predictor rather than an ensemble of $M$
+and the network.
+
+\paragraph{Novelty relative to the temporal-graph literature.}
+To our knowledge no surveyed temporal-graph method materializes dense
+per-(user,item) state. Existing designs either keep a \emph{per-node} memory
+(JODIE, TGN, TGNv2)---which our per-pair cell generalizes into an explicit
+$(u,i)$ entry---rely on inductive attention over sampled neighbors (TGAT,
+DyGFormer) with no persistent per-pair statistic, or add global / virtual
+persistence state (NAViS). Positioning our contribution against this landscape,
+the distinguishing choice is the \emph{granularity} of the persistence state
+(per-pair, Eq.~\ref{eq:perpair-ssm}) together with the structural
+precondition---$N_{\text{item}}\!\ll\!N_{\text{user}}$---that alone makes such a
+dense state affordable.
+
+\end{document}
+

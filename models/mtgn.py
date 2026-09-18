@@ -279,9 +279,10 @@ class LastNeighborLoader:
 
         return n_id, torch.stack([neighbors, nodes]), e_id
 
-    def insert(self, src: Tensor, dst: Tensor):
+    def insert(self, src: Tensor, dst: Tensor, t: Tensor = None, msg: Tensor = None):
         # Inserts newly encountered interactions into an ever-growing
-        # (undirected) temporal graph.
+        # (undirected) temporal graph. `t`/`msg` are accepted for a uniform
+        # sampler interface (MSampler needs them) and ignored here.
 
         # Collect central nodes, their neighbors and the current event ids.
         neighbors = torch.cat([src, dst], dim=0)
